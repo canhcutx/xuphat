@@ -1,22 +1,42 @@
 import json
 import os
 import threading
-import discord  # Cần cài đặt gói: discord.py-self
+import discord  # Gói discord.py-self
 from flask import Flask
 import requests
 
-# Lấy Token & Webhook từ biến môi trường
+# Lấy Token từ biến môi trường
 TOKEN = os.getenv("TOKEN") or os.getenv("DISCORD_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# Ép kiểu int cho SOURCE_CHANNEL_ID
-RAW_CHANNEL_ID = os.getenv("SOURCE_CHANNEL_ID")
-SOURCE_CHANNEL_ID = int(RAW_CHANNEL_ID) if RAW_CHANNEL_ID else None
+# Lấy cấu hình các cặp kênh nguồn -> webhook đích
+# Ví dụ cấu hình: "CHANNEL_ID_1:WEBHOOK_URL_1,CHANNEL_ID_2:WEBHOOK_URL_2"
+CHANNEL_MAP_RAW = os.getenv("CHANNEL_MAP", "")
+
+# Chuyển đổi chuỗi CHANNEL_MAP thành dictionary { channel_id_int: webhook_url_str }
+CHANNEL_MAP = {}
+if CHANNEL_MAP_RAW:
+    pairs = CHANNEL_MAP_RAW.split(",")
+    for pair in pairs:
+        if ":" in pair:
+            ch_id, wh_url = pair.strip().split(":", 1)
+            try:
+                CHANNEL_MAP[int(ch_id.strip())] = wh_url.strip()
+            except ValueError:
+                print(f"⚠️ Channel ID không hợp lệ: {ch_id}")
+
+# Nếu vẫn muốn hỗ trợ cấu hình kiểu cũ (1 kênh)
+SINGLE_SOURCE_ID = os.getenv("SOURCE_CHANNEL_ID")
+SINGLE_WEBHOOK = os.getenv("WEBHOOK_URL")
+if SINGLE_SOURCE_ID and SINGLE_WEBHOOK:
+    try:
+        CHANNEL_MAP[int(SINGLE_SOURCE_ID)] = SINGLE_WEBHOOK
+    except ValueError:
+        pass
 
 MAP_FILE = "message_map.json"
 
 # -------------------------
-# Load / Save mapping
+# Load / Save mapping ID tin nhắn
 # -------------------------
 
 def load_map():
@@ -41,110 +61,113 @@ message_map = load_map()
 # Discord Selfbot Setup
 # -------------------------
 
-# Đối với Selfbot (User Account), dùng Client cơ bản
 client = discord.Client()
 
 @client.event
 async def on_ready():
     print(f"✅ Selfbot đã đăng nhập thành công dưới tên: {client.user}")
+    print(f"📌 Đang theo dõi {len(CHANNEL_MAP)} kênh cấu hình.")
 
 @client.event
 async def on_message(message):
-    # Lọc kênh tin nhắn
-    if not SOURCE_CHANNEL_ID or message.channel.id != SOURCE_CHANNEL_ID:
+    # Kiểm tra xem kênh nhắn tin có nằm trong danh sách theo dõi không
+    if message.channel.id not in CHANNEL_MAP:
         return
 
+    webhook_url = CHANNEL_MAP[message.channel.id]
     content = message.content
 
-    # Nối link các tệp đính kèm (ảnh, file) vào nội dung tin nhắn
+    # Nối link file/ảnh đính kèm
     if message.attachments:
         for a in message.attachments:
             content += f"\n{a.url}"
 
-    # Nếu không có nội dung lẫn file thì không gửi
     if not content.strip():
         return
 
-    if WEBHOOK_URL:
-        try:
-            r = requests.post(
-                WEBHOOK_URL + "?wait=true",
-                json={
-                    "username": message.author.display_name,
-                    "avatar_url": str(message.author.display_avatar.url),
-                    "content": content,
-                },
-                timeout=10
-            )
+    try:
+        r = requests.post(
+            webhook_url + "?wait=true",
+            json={
+                "username": message.author.display_name,
+                "avatar_url": str(message.author.display_avatar.url),
+                "content": content,
+            },
+            timeout=10
+        )
 
-            if r.status_code in [200, 204]:
-                data = r.json()
-                message_map[str(message.id)] = data["id"]
-                save_map()
-                print(f"FORWARD -> Msg ID: {message.id}")
-        except Exception as e:
-            print(f"❌ Lỗi gửi Webhook: {e}")
+        if r.status_code in [200, 204]:
+            data = r.json()
+            message_map[str(message.id)] = {
+                "webhook_msg_id": data["id"],
+                "webhook_url": webhook_url
+            }
+            save_map()
+            print(f"FORWARD [{message.channel.id}] -> Msg ID: {message.id}")
+    except Exception as e:
+        print(f"❌ Lỗi gửi Webhook: {e}")
 
 @client.event
 async def on_message_edit(before, after):
-    if not SOURCE_CHANNEL_ID or before.channel.id != SOURCE_CHANNEL_ID:
+    if before.channel.id not in CHANNEL_MAP:
         return
 
     source_id = str(before.id)
     if source_id not in message_map:
         return
 
-    webhook_msg_id = message_map[source_id]
-    content = after.content
+    map_info = message_map[source_id]
+    webhook_msg_id = map_info["webhook_msg_id"]
+    webhook_url = map_info["webhook_url"]
 
+    content = after.content
     if after.attachments:
         for a in after.attachments:
             content += f"\n{a.url}"
 
-    if WEBHOOK_URL:
-        try:
-            requests.patch(
-                f"{WEBHOOK_URL}/messages/{webhook_msg_id}",
-                json={"content": content},
-                timeout=10
-            )
-            print(f"EDIT -> Msg ID: {before.id}")
-        except Exception as e:
-            print(f"❌ Lỗi sửa Webhook: {e}")
+    try:
+        requests.patch(
+            f"{webhook_url}/messages/{webhook_msg_id}",
+            json={"content": content},
+            timeout=10
+        )
+        print(f"EDIT [{before.channel.id}] -> Msg ID: {before.id}")
+    except Exception as e:
+        print(f"❌ Lỗi sửa Webhook: {e}")
 
 @client.event
 async def on_message_delete(message):
-    if not SOURCE_CHANNEL_ID or message.channel.id != SOURCE_CHANNEL_ID:
+    if message.channel.id not in CHANNEL_MAP:
         return
 
     source_id = str(message.id)
     if source_id not in message_map:
         return
 
-    webhook_msg_id = message_map[source_id]
+    map_info = message_map[source_id]
+    webhook_msg_id = map_info["webhook_msg_id"]
+    webhook_url = map_info["webhook_url"]
 
-    if WEBHOOK_URL:
-        try:
-            requests.delete(f"{WEBHOOK_URL}/messages/{webhook_msg_id}", timeout=10)
-            del message_map[source_id]
-            save_map()
-            print(f"DELETE -> Msg ID: {message.id}")
-        except Exception as e:
-            print(f"❌ Lỗi xóa Webhook: {e}")
+    try:
+        requests.delete(f"{webhook_url}/messages/{webhook_msg_id}", timeout=10)
+        del message_map[source_id]
+        save_map()
+        print(f"DELETE [{message.channel.id}] -> Msg ID: {message.id}")
+    except Exception as e:
+        print(f"❌ Lỗi xóa Webhook: {e}")
 
 # -------------------------
-# Web Server Keep-Alive (Dành cho Render)
+# Web Server Keep-Alive
 # -------------------------
 
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Selfbot Mirror is Alive 24/7!"
+    return "Multi-Channel Selfbot Mirror is Alive 24/7!"
 
 def run_bot():
     if TOKEN:
-        # discord.py-self chạy bằng User Token
         client.run(TOKEN)
     else:
         print("❌ LỖI: Chưa cài đặt TOKEN biến môi trường!")
