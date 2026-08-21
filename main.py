@@ -28,6 +28,10 @@ if SINGLE_SOURCE_ID and SINGLE_WEBHOOK:
     except ValueError:
         pass
 
+# Lưu ánh xạ: original_message_id -> {"webhook_url": str, "webhook_msg_id": str}
+# Lưu ý: Nếu khởi động lại bot/server, các tin nhắn cũ trước đó sẽ không còn lưu trong RAM
+MESSAGE_MAP = {}
+
 client = discord.Client()
 
 @client.event
@@ -55,8 +59,11 @@ async def on_message(message):
         return
 
     try:
-        requests.post(
-            webhook_url,
+        # Thêm ?wait=true để Discord trả về thông tin tin nhắn vừa tạo trên Webhook
+        wh_post_url = webhook_url.split("?")[0] + "?wait=true"
+        
+        resp = requests.post(
+            wh_post_url,
             json={
                 "username": message.author.display_name,
                 "avatar_url": str(message.author.display_avatar.url),
@@ -64,16 +71,70 @@ async def on_message(message):
             },
             timeout=10
         )
-        print(f"✅ ĐÃ LƯU [{message.channel.id}] -> Msg ID: {message.id}")
+        
+        if resp.status_code in [200, 201]:
+            data = resp.json()
+            wh_msg_id = data.get("id")
+            if wh_msg_id:
+                # Lưu lại ID để phục vụ việc sửa tin sau này
+                MESSAGE_MAP[message.id] = {
+                    "webhook_url": webhook_url.split("?")[0],
+                    "webhook_msg_id": wh_msg_id
+                }
+            print(f"✅ ĐÃ LƯU [{message.channel.id}] -> Msg ID: {message.id} (Webhook Msg ID: {wh_msg_id})")
+        else:
+            print(f"⚠️ Webhook trả lời mã lỗi {resp.status_code}: {resp.text}")
+
     except Exception as e:
         print(f"❌ Lỗi gửi Webhook: {e}")
+
+# -------------------------
+# Khi người dùng chỉnh sửa tin nhắn gốc
+# -------------------------
+@client.event
+async def on_message_edit(before, after):
+    if after.channel.id not in CHANNEL_MAP:
+        return
+
+    # Nếu không có trong danh sách lưu tạm (ví dụ bot vừa restart hoặc gửi trước khi bot chạy)
+    if after.id not in MESSAGE_MAP:
+        print(f"⚠️ Không tìm thấy Webhook Message ID cho tin nhắn gốc {after.id} để cập nhật.")
+        return
+
+    mapping = MESSAGE_MAP[after.id]
+    webhook_url = mapping["webhook_url"]
+    webhook_msg_id = mapping["webhook_msg_id"]
+
+    new_content = after.content
+    if after.attachments:
+        for a in after.attachments:
+            new_content += f"\n{a.url}"
+
+    if not new_content.strip():
+        return
+
+    edit_url = f"{webhook_url}/messages/{webhook_msg_id}"
+
+    try:
+        resp = requests.patch(
+            edit_url,
+            json={
+                "content": new_content
+            },
+            timeout=10
+        )
+        if resp.status_code == 200:
+            print(f"✏️ ĐÃ CẬP NHẬT tin nhắn ID {after.id} -> Webhook Msg ID: {webhook_msg_id}")
+        else:
+            print(f"❌ Lỗi cập nhật Webhook (HTTP {resp.status_code}): {resp.text}")
+    except Exception as e:
+        print(f"❌ Lỗi gửi yêu cầu PATCH: {e}")
 
 # -------------------------
 # Khi người dùng xóa tin nhắn gốc
 # -------------------------
 @client.event
 async def on_message_delete(message):
-    # BỎ QUA - KHÔNG XÓA TIN NHẮN TRÊN WEBHOOK ĐỂ LƯU TRỮ VĨNH VIỄN
     if message.channel.id in CHANNEL_MAP:
         print(f"🛡️ Tin nhắn ID {message.id} bị xóa ở kênh gốc nhưng đã được giữ lại trên Webhook.")
 
